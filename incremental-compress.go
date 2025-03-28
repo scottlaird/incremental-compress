@@ -2,6 +2,7 @@ package main
 
 import (
         "compress/gzip"
+        "crypto/sha1"
         "flag"
         "fmt"
         "io"
@@ -12,26 +13,24 @@ import (
         "strings"
         "sync"
         "time"
-        "crypto/sha1"
-        "strconv"
 
-        
         "github.com/DataDog/zstd" // much better compression than "github.com/klauspost/compress/zstd"
         "github.com/andybalholm/brotli"
-        "github.com/chaisql/chai"
+        "zombiezen.com/go/sqlite"
+        "zombiezen.com/go/sqlite/sqlitex"
 )
 
 var (
-        verboseFlag     = flag.Bool("verbose", false, "Show status")
-        dirFlag         = flag.String("dir", ".", "Directory to search for compressable files")
-        gzipFlag        = flag.Bool("gzip", true, "Compress with gzip")
-        gzipLevelFlag   = flag.Int("gzip_level", 9, "gzip compression level")
-        zstdFlag        = flag.Bool("zstd", true, "Compress with zstd")
-        zstdLevelFlag   = flag.Int("zstd_level", 19, "zstd compression level")
-        brotliFlag      = flag.Bool("brotli", true, "Compress with brotli")
-        brotliLevelFlag = flag.Int("brotli_level", 11, "brotli compression level")
-        typesFlag       = flag.String("types", "html,css,js,json,xml,ico,svg,md", "File types to compress, seperated by a comma")
-        stateDirFlag    = flag.String("statedir", "", "Directory saving checksums and other state across runs")
+        verboseFlag       = flag.Bool("verbose", false, "Show status")
+        dirFlag           = flag.String("dir", ".", "Directory to search for compressable files")
+        gzipFlag          = flag.Bool("gzip", true, "Compress with gzip")
+        gzipLevelFlag     = flag.Int("gzip_level", 9, "gzip compression level")
+        zstdFlag          = flag.Bool("zstd", true, "Compress with zstd")
+        zstdLevelFlag     = flag.Int("zstd_level", 19, "zstd compression level")
+        brotliFlag        = flag.Bool("brotli", true, "Compress with brotli")
+        brotliLevelFlag   = flag.Int("brotli_level", 11, "brotli compression level")
+        typesFlag         = flag.String("types", "html,css,js,json,xml,ico,svg,md", "File types to compress, seperated by a comma")
+        stateDirFlag      = flag.String("statedir", "", "Directory saving checksums and other state across runs")
         preserveMtimeFlag = flag.Bool("preserve_mtime", true, "Preserve mtime for files with the same checksum")
 
         types   []string
@@ -39,12 +38,13 @@ var (
         failure = false
         wg      sync.WaitGroup
 
-        state = "Starting"
+        state            = "Starting"
         countMutex       sync.Mutex
         totalFileCount   = 0
         pendingFileCount = 0
 )
 
+// Start processing a file.
 func start() {
         wg.Add(1)
         countMutex.Lock()
@@ -53,6 +53,7 @@ func start() {
         countMutex.Unlock()
 }
 
+// Mark a file as complete.
 func done() {
         wg.Done()
         countMutex.Lock()
@@ -60,6 +61,8 @@ func done() {
         countMutex.Unlock()
 }
 
+// Compress a file using gzip, reusing the times and permissions of
+// the original file.
 func doGzip(path string, info fs.FileInfo) {
         defer done()
         outpath := path + ".gz"
@@ -114,6 +117,8 @@ func doGzip(path string, info fs.FileInfo) {
 
 }
 
+// Compress a file using zstd, reusing the times and permissions of
+// the original file.
 func doZstd(path string, info fs.FileInfo) {
         defer done()
         outpath := path + ".zst"
@@ -163,6 +168,8 @@ func doZstd(path string, info fs.FileInfo) {
         }
 }
 
+// Compress a file using brotli, reusing the times and permissions of
+// the original file.
 func doBrotli(path string, info fs.FileInfo) {
         defer done()
         outpath := path + ".br"
@@ -212,20 +219,22 @@ func doBrotli(path string, info fs.FileInfo) {
         }
 }
 
-func walkFile(db *chai.DB, path string, info fs.FileInfo, err error) error {
+// Process a single file.  Used as a callback (indirectly) from filepath.Walk.
+func walkFile(conn *sqlite.Conn, path string, info fs.FileInfo, err error) error {
         if info.IsDir() {
                 return nil
         }
 
         for _, fileType := range types {
                 if strings.HasSuffix(path, "."+fileType) {
-                        return maybeCompressFile(db, path, info)
+                        return maybeCompressFile(conn, path, info)
                 }
         }
         return nil
 }
 
-func checkCompressedFile(db *chai.DB, path string, info fs.FileInfo, extension string) bool {
+// Check a compressed file to see if it needs to be rebuilt.
+func checkCompressedFile(conn *sqlite.Conn, path string, info fs.FileInfo, extension string) bool {
         compressed, err := os.Stat(path + extension)
 
         if err != nil || compressed.ModTime().Before(info.ModTime()) {
@@ -234,72 +243,87 @@ func checkCompressedFile(db *chai.DB, path string, info fs.FileInfo, extension s
         return false
 }
 
-
-func checkSourceFile(db *chai.DB, path string, info fs.FileInfo) bool {
-        if db != nil {
+// Check a source file to see if it needs to be rebuilt
+func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
+        if conn != nil {
                 sha := sha1.New()
-                data, err := os.ReadFile(path)
+                data, err := os.ReadFile(path)  // TODO(scottlaird): memory!
                 if err != nil {
                         panic(err)
                 }
                 sha.Write(data)
                 checksum := fmt.Sprintf("%x", sha.Sum(nil))
 
-                row, err := db.QueryRow("select mtime from checksumstate where checksum=? and filename=?", checksum, path)
-                if err != nil {
-                        if fmt.Sprintf("%v", err) == "row not found" {  // so ugly
-                                if *verboseFlag {
-                                        fmt.Printf("Didn't find %s with a checkum of %s (%v), inserting!\n", path, checksum, err)
-                                }
-                                err := db.Exec(`delete from checksumstate where filename=?`, path)
-                                if err != nil { panic(err) }
-                                err = db.Exec(`insert into checksumstate values (?, ?, ?)`, path, checksum, info.ModTime().Unix() )
-                                if err != nil { panic(err) }
-                                return true
-                        } else {
-                                log.Printf("Error checking database for state: %v", err)
-                        }
-                }
-                o := row.Object()
-                value, err := o.GetByField("mtime")
+                stmt, err := conn.Prepare("select mtime from checksumstate where checksum=$checksum and filename=$filename;")
                 if err != nil {
                         panic(err)
                 }
-                v := value.String()
-                i, _ := strconv.ParseInt(v, 10, 64)
-                t := time.Unix(i, 0)
+                stmt.SetText("$checksum", checksum)
+                stmt.SetText("$filename", path)
 
-                if t != info.ModTime() {
+                var mtime time.Time
+
+                if hasRow, err := stmt.Step(); err != nil {
+                        v := stmt.GetInt64("mtime")
+                        mtime = time.Unix(v, 0)
+                } else if !hasRow {
                         if *verboseFlag {
-                                logger.Printf("Changing mtime of %q from %s to %s", path, info.ModTime().String(), t.String())
+                                fmt.Printf("Didn't find %s with a checkum of %s (%v), inserting!\n", path, checksum, err)
                         }
-                        err = os.Chtimes(path, t, t)
+                        err = sqlitex.ExecuteTransient(
+                                conn,
+                                "delete from checksumstate where filename=?;",
+                                &sqlitex.ExecOptions{
+                                        Args: []any{path,},
+                                },
+                        )
+                        if err != nil {
+                                panic(err)
+                        }
+
+                        err = sqlitex.ExecuteTransient(
+                                conn,
+                                `insert into checksumstate values (?, ?, ?);`,
+                                &sqlitex.ExecOptions{
+                                        Args: []any{path, checksum, info.ModTime().Unix(),},
+                                })
+                        
+                        if err != nil {
+                                panic(err)
+                        }
+                        return true
+                }
+                
+                if mtime != info.ModTime() {
+                        if *verboseFlag {
+                                logger.Printf("Changing mtime of %q from %s to %s", path, info.ModTime().String(), mtime.String())
+                        }
+                        err = os.Chtimes(path, mtime, mtime)
                         if err != nil {
                                 panic(err)
                         }
                 }
-                
                 
                 return false
         }
         return false
 }
 
-func maybeCompressFile(db *chai.DB, path string, info fs.FileInfo) error {
+func maybeCompressFile(conn *sqlite.Conn, path string, info fs.FileInfo) error {
         //fmt.Printf("MaybeCompress %q\n", path)
 
-        forceRecompress := checkSourceFile(db, path, info)
+        forceRecompress := checkSourceFile(conn, path, info)
         info, _ = os.Stat(path)
 
-        if *gzipFlag && (forceRecompress || checkCompressedFile(db, path, info, ".gz")) {
+        if *gzipFlag && (forceRecompress || checkCompressedFile(conn, path, info, ".gz")) {
                 start()
                 go doGzip(path, info)
         }
-        if *zstdFlag && (forceRecompress || checkCompressedFile(db, path, info, ".zst")) {
+        if *zstdFlag && (forceRecompress || checkCompressedFile(conn, path, info, ".zst")) {
                 start()
                 go doZstd(path, info)
         }
-        if *brotliFlag && (forceRecompress || checkCompressedFile(db, path, info, ".br")) {
+        if *brotliFlag && (forceRecompress || checkCompressedFile(conn, path, info, ".br")) {
                 start()
                 go doBrotli(path, info)
         }
@@ -310,10 +334,10 @@ func printStatus() {
         known := "known "
         for {
                 if state == "Compressing" {
-                        known =""
+                        known = ""
                 }
                 fmt.Printf("%s, %d of %d %sfiles queued to be compressed           \r", state, pendingFileCount, totalFileCount, known)
-                time.Sleep(50*time.Millisecond)
+                time.Sleep(50 * time.Millisecond)
         }
 }
 
@@ -322,24 +346,27 @@ func main() {
         types = strings.Split(*typesFlag, ",")
         logger = log.New(os.Stderr, "", 0)
 
-        var db *chai.DB
+        var conn *sqlite.Conn
         var err error
 
         if *stateDirFlag != "" {
-                db, err = chai.Open(*stateDirFlag)
+                conn, err = sqlite.OpenConn(*stateDirFlag)
                 if err != nil {
                         panic(err)
                 }
-                defer db.Close()
+                defer conn.Close()
 
-                db.Exec(` CREATE TABLE checksumstate ( filename text primary key, checksum text, mtime int )`)
+                err := sqlitex.ExecuteScript(conn, `CREATE TABLE IF NOT EXISTS checksumstate ( filename text primary key, checksum text, mtime int )`, &sqlitex.ExecOptions{})
+                if err != nil {
+                        panic(err)
+                }
 
         }
 
         go printStatus()
 
         state = "Finding files"
-        err = filepath.Walk(*dirFlag, func(path string, info fs.FileInfo, err error) error { walkFile(db, path, info, err); return nil })
+        err = filepath.Walk(*dirFlag, func(path string, info fs.FileInfo, err error) error { walkFile(conn, path, info, err); return nil })
         if err != nil {
                 panic(err)
         }
