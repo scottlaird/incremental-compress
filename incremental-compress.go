@@ -12,9 +12,13 @@ import (
         "strings"
         "sync"
         "time"
+        "crypto/sha1"
+        "strconv"
 
+        
+        "github.com/DataDog/zstd" // much better compression than "github.com/klauspost/compress/zstd"
         "github.com/andybalholm/brotli"
-        "github.com/DataDog/zstd"  // much better compression than "github.com/klauspost/compress/zstd"
+        "github.com/chaisql/chai"
 )
 
 var (
@@ -27,12 +31,15 @@ var (
         brotliFlag      = flag.Bool("brotli", true, "Compress with brotli")
         brotliLevelFlag = flag.Int("brotli_level", 11, "brotli compression level")
         typesFlag       = flag.String("types", "html,css,js,json,xml,ico,svg,md", "File types to compress, seperated by a comma")
+        stateDirFlag    = flag.String("statedir", "", "Directory saving checksums and other state across runs")
+        preserveMtimeFlag = flag.Bool("preserve_mtime", true, "Preserve mtime for files with the same checksum")
 
         types   []string
         logger  *log.Logger
         failure = false
         wg      sync.WaitGroup
 
+        state = "Starting"
         countMutex       sync.Mutex
         totalFileCount   = 0
         pendingFileCount = 0
@@ -58,7 +65,7 @@ func doGzip(path string, info fs.FileInfo) {
         outpath := path + ".gz"
 
         if *verboseFlag {
-                fmt.Printf("gzip %q\n", path)
+                logger.Printf("gzip %q", path)
         }
 
         reader, err := os.Open(path)
@@ -112,7 +119,7 @@ func doZstd(path string, info fs.FileInfo) {
         outpath := path + ".zst"
 
         if *verboseFlag {
-                fmt.Printf("zstd %q\n", path)
+                logger.Printf("zstd %q", path)
         }
 
         reader, err := os.Open(path)
@@ -205,39 +212,94 @@ func doBrotli(path string, info fs.FileInfo) {
         }
 }
 
-func walkFile(path string, info fs.FileInfo, err error) error {
+func walkFile(db *chai.DB, path string, info fs.FileInfo, err error) error {
         if info.IsDir() {
                 return nil
         }
 
         for _, fileType := range types {
                 if strings.HasSuffix(path, "."+fileType) {
-                        return maybeCompressFile(path, info)
+                        return maybeCompressFile(db, path, info)
                 }
         }
         return nil
 }
 
-func checkCompressedFile(path string, info fs.FileInfo, extension string) bool {
+func checkCompressedFile(db *chai.DB, path string, info fs.FileInfo, extension string) bool {
         compressed, err := os.Stat(path + extension)
+
         if err != nil || compressed.ModTime().Before(info.ModTime()) {
                 return true
         }
         return false
 }
 
-func maybeCompressFile(path string, info fs.FileInfo) error {
+
+func checkSourceFile(db *chai.DB, path string, info fs.FileInfo) bool {
+        if db != nil {
+                sha := sha1.New()
+                data, err := os.ReadFile(path)
+                if err != nil {
+                        panic(err)
+                }
+                sha.Write(data)
+                checksum := fmt.Sprintf("%x", sha.Sum(nil))
+
+                row, err := db.QueryRow("select mtime from checksumstate where checksum=? and filename=?", checksum, path)
+                if err != nil {
+                        if fmt.Sprintf("%v", err) == "row not found" {  // so ugly
+                                if *verboseFlag {
+                                        fmt.Printf("Didn't find %s with a checkum of %s (%v), inserting!\n", path, checksum, err)
+                                }
+                                err := db.Exec(`delete from checksumstate where filename=?`, path)
+                                if err != nil { panic(err) }
+                                err = db.Exec(`insert into checksumstate values (?, ?, ?)`, path, checksum, info.ModTime().Unix() )
+                                if err != nil { panic(err) }
+                                return true
+                        } else {
+                                log.Printf("Error checking database for state: %v", err)
+                        }
+                }
+                o := row.Object()
+                value, err := o.GetByField("mtime")
+                if err != nil {
+                        panic(err)
+                }
+                v := value.String()
+                i, _ := strconv.ParseInt(v, 10, 64)
+                t := time.Unix(i, 0)
+
+                if t != info.ModTime() {
+                        if *verboseFlag {
+                                logger.Printf("Changing mtime of %q from %s to %s", path, info.ModTime().String(), t.String())
+                        }
+                        err = os.Chtimes(path, t, t)
+                        if err != nil {
+                                panic(err)
+                        }
+                }
+                
+                
+                return false
+        }
+        return false
+}
+
+func maybeCompressFile(db *chai.DB, path string, info fs.FileInfo) error {
         //fmt.Printf("MaybeCompress %q\n", path)
 
-        if *gzipFlag && checkCompressedFile(path, info, ".gz") {
+        forceRecompress := checkSourceFile(db, path, info)
+        info, _ = os.Stat(path)
+
+        if *gzipFlag && (forceRecompress || checkCompressedFile(db, path, info, ".gz")) {
                 start()
                 go doGzip(path, info)
         }
-        if *zstdFlag && checkCompressedFile(path, info, ".zst") {
+        if *zstdFlag && (forceRecompress || checkCompressedFile(db, path, info, ".zst")) {
                 start()
                 go doZstd(path, info)
         }
-        if *brotliFlag && checkCompressedFile(path, info, ".br") {
+        if *brotliFlag && (forceRecompress || checkCompressedFile(db, path, info, ".br")) {
                 start()
                 go doBrotli(path, info)
         }
@@ -245,13 +307,13 @@ func maybeCompressFile(path string, info fs.FileInfo) error {
 }
 
 func printStatus() {
+        known := "known "
         for {
-                fmt.Printf("Compressing, %d of %d files remain\n", pendingFileCount, totalFileCount)
-                time.Sleep(time.Second)
-
-                if pendingFileCount == 0 {
-                        return
+                if state == "Compressing" {
+                        known =""
                 }
+                fmt.Printf("%s, %d of %d %sfiles queued to be compressed           \r", state, pendingFileCount, totalFileCount, known)
+                time.Sleep(50*time.Millisecond)
         }
 }
 
@@ -260,16 +322,36 @@ func main() {
         types = strings.Split(*typesFlag, ",")
         logger = log.New(os.Stderr, "", 0)
 
-        err := filepath.Walk(*dirFlag, walkFile)
+        var db *chai.DB
+        var err error
+
+        if *stateDirFlag != "" {
+                db, err = chai.Open(*stateDirFlag)
+                if err != nil {
+                        panic(err)
+                }
+                defer db.Close()
+
+                db.Exec(` CREATE TABLE checksumstate ( filename text primary key, checksum text, mtime int )`)
+
+        }
+
+        go printStatus()
+
+        state = "Finding files"
+        err = filepath.Walk(*dirFlag, func(path string, info fs.FileInfo, err error) error { walkFile(db, path, info, err); return nil })
         if err != nil {
                 panic(err)
         }
-
-        printStatus()
+        state = "Compressing"
 
         wg.Wait()
+
+        state = "Exiting"
 
         if failure {
                 os.Exit(1)
         }
+
+        fmt.Printf("\n")
 }
