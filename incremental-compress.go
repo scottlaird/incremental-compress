@@ -21,6 +21,7 @@ import (
 )
 
 var (
+        quietFlag         = flag.Bool("quiet", false, "Avoid printing status updates")
         verboseFlag       = flag.Bool("verbose", false, "Show status")
         dirFlag           = flag.String("dir", ".", "Directory to search for compressable files")
         gzipFlag          = flag.Bool("gzip", true, "Compress with gzip")
@@ -38,17 +39,26 @@ var (
         failure = false
         wg      sync.WaitGroup
 
-        state            = "Starting"
-        countMutex       sync.Mutex
-        totalFileCount   = 0
-        pendingFileCount = 0
+        state                     = "Starting"
+        countMutex                sync.Mutex
+        totalFileCount            = 0
+        compressedFileUpdateCount = 0
+        handledFileCount          = 0
+        pendingFileCount          = 0
+        checksummedCount          = 0
 )
+
+func foundFile() {
+        countMutex.Lock()
+        totalFileCount++
+        countMutex.Unlock()
+}
 
 // Start processing a file.
 func start() {
         wg.Add(1)
         countMutex.Lock()
-        totalFileCount++
+        handledFileCount++
         pendingFileCount++
         countMutex.Unlock()
 }
@@ -58,6 +68,18 @@ func done() {
         wg.Done()
         countMutex.Lock()
         pendingFileCount--
+        countMutex.Unlock()
+}
+
+func compressed() {
+        countMutex.Lock()
+        compressedFileUpdateCount++
+        countMutex.Unlock()
+}
+
+func checksummed() {
+        countMutex.Lock()
+        checksummedCount++
         countMutex.Unlock()
 }
 
@@ -115,6 +137,7 @@ func doGzip(path string, info fs.FileInfo) {
                 return
         }
 
+        compressed()
 }
 
 // Compress a file using zstd, reusing the times and permissions of
@@ -166,6 +189,7 @@ func doZstd(path string, info fs.FileInfo) {
                 failure = true
                 return
         }
+        compressed()
 }
 
 // Compress a file using brotli, reusing the times and permissions of
@@ -217,6 +241,7 @@ func doBrotli(path string, info fs.FileInfo) {
                 failure = true
                 return
         }
+        compressed()
 }
 
 // Process a single file.  Used as a callback (indirectly) from filepath.Walk.
@@ -227,7 +252,9 @@ func walkFile(conn *sqlite.Conn, path string, info fs.FileInfo, err error) error
 
         for _, fileType := range types {
                 if strings.HasSuffix(path, "."+fileType) {
+                        foundFile()
                         return maybeCompressFile(conn, path, info)
+                        //return nil
                 }
         }
         return nil
@@ -247,12 +274,16 @@ func checkCompressedFile(conn *sqlite.Conn, path string, info fs.FileInfo, exten
 func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
         if conn != nil {
                 sha := sha1.New()
-                data, err := os.ReadFile(path)  // TODO(scottlaird): memory!
+
+                file, err := os.Open(path)
                 if err != nil {
                         panic(err)
                 }
-                sha.Write(data)
+                io.Copy(sha, file)
+                file.Close()
+
                 checksum := fmt.Sprintf("%x", sha.Sum(nil))
+                checksummed()
 
                 stmt, err := conn.Prepare("select mtime from checksumstate where checksum=$checksum and filename=$filename;")
                 if err != nil {
@@ -263,10 +294,16 @@ func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
 
                 var mtime time.Time
 
-                if hasRow, err := stmt.Step(); err != nil {
+                hasRow, err := stmt.Step()
+
+                if err != nil {
+                        panic(err)
+                }
+
+                if hasRow {
                         v := stmt.GetInt64("mtime")
                         mtime = time.Unix(v, 0)
-                } else if !hasRow {
+                } else {
                         if *verboseFlag {
                                 fmt.Printf("Didn't find %s with a checkum of %s (%v), inserting!\n", path, checksum, err)
                         }
@@ -274,7 +311,7 @@ func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
                                 conn,
                                 "delete from checksumstate where filename=?;",
                                 &sqlitex.ExecOptions{
-                                        Args: []any{path,},
+                                        Args: []any{path},
                                 },
                         )
                         if err != nil {
@@ -285,15 +322,15 @@ func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
                                 conn,
                                 `insert into checksumstate values (?, ?, ?);`,
                                 &sqlitex.ExecOptions{
-                                        Args: []any{path, checksum, info.ModTime().Unix(),},
+                                        Args: []any{path, checksum, info.ModTime().Unix()},
                                 })
-                        
+
                         if err != nil {
                                 panic(err)
                         }
                         return true
                 }
-                
+
                 if mtime != info.ModTime() {
                         if *verboseFlag {
                                 logger.Printf("Changing mtime of %q from %s to %s", path, info.ModTime().String(), mtime.String())
@@ -303,15 +340,12 @@ func checkSourceFile(conn *sqlite.Conn, path string, info fs.FileInfo) bool {
                                 panic(err)
                         }
                 }
-                
                 return false
         }
         return false
 }
 
 func maybeCompressFile(conn *sqlite.Conn, path string, info fs.FileInfo) error {
-        //fmt.Printf("MaybeCompress %q\n", path)
-
         forceRecompress := checkSourceFile(conn, path, info)
         info, _ = os.Stat(path)
 
@@ -330,13 +364,15 @@ func maybeCompressFile(conn *sqlite.Conn, path string, info fs.FileInfo) error {
         return nil
 }
 
+func writeStatusMessage() {
+        if !*quietFlag {
+                fmt.Fprintf(os.Stderr, "%s, %d compressed files updated, %d source files queued to compress, %d checked so far           \r", state, compressedFileUpdateCount, pendingFileCount, totalFileCount)
+        }
+}
+
 func printStatus() {
-        known := "known "
         for {
-                if state == "Compressing" {
-                        known = ""
-                }
-                fmt.Printf("%s, %d of %d %sfiles queued to be compressed           \r", state, pendingFileCount, totalFileCount, known)
+                writeStatusMessage()
                 time.Sleep(50 * time.Millisecond)
         }
 }
@@ -380,5 +416,8 @@ func main() {
                 os.Exit(1)
         }
 
-        fmt.Printf("\n")
+        if !*quietFlag {
+                writeStatusMessage()
+                fmt.Fprintf(os.Stderr, "\n")
+        }
 }
