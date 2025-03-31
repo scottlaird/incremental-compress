@@ -38,7 +38,7 @@ Install a current version of Go, then run
 $ go install github.com/scottlaird/incremental-compress@latest
 ```
 
-This will write an `incremenal-compress` executable into your Go
+This will write an `incremental-compress` executable into your Go
 binary directory, typically `~/go/bin`.
 
 ## Usage
